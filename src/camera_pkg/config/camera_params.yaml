@@ -1,0 +1,5 @@
+image_publisher:          # 실행 노드 이름과 반드시 일치
+  ros__parameters:       # 이 키워드를 반드시 써야 함
+    publish_rate: 10.0
+    topic_name: "image_raw"
+    image_size: [320, 240]

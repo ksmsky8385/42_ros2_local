@@ -1,0 +1,8 @@
+# Goal:
+float32 target_distance
+---
+# Result:
+bool reached
+---
+# Feedback:
+float32 current_distance

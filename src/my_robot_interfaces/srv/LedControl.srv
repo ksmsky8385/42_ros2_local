@@ -1,0 +1,8 @@
+# LedControl.srv
+
+# Request
+bool state
+---
+# Response
+bool success
+string message
