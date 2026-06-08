@@ -10,7 +10,8 @@ from ultralytics import YOLO
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
+from turtlebot3_msgs.srv import Sound  # 📢 사운드 서비스 추가
 from cv_bridge import CvBridge
 
 # Wayland/X11 호환성 설정
@@ -45,37 +46,52 @@ class PoseEstimationNode(Node):
 
         self.bridge = CvBridge()
 
+        # 📢 [추가] 연속 사운드 호출 방지를 위한 타이머 변수
+        self.last_sound_time = self.get_clock().now()
+        self.SOUND_COOL_DOWN = 2.0  # 한 번 소리 내면 2초 동안은 중복 호출 방지
+
         # 2. YOLOv8 포즈 모델 로드
         self.get_logger().info("YOLOv8 포즈 추정 모델을 로드 중...")
         self.model = YOLO('yolov8n-pose.pt')
 
-        # 3. ROS2 구독(Subscriber) 및 발행(Publisher) 설정
-        # 다른 카메라 노드(img_pub 등)가 보내주는 raw 이미지를 구독합니다.
+        # 3. ROS2 구독(Subscriber), 발행(Publisher), 클라이언트(Client) 설정
         self.img_sub = self.create_subscription(
-            Image, 
-            'image_raw', 
-            self.image_callback, 
+            CompressedImage,
+            'image_raw/compressed',
+            self.image_callback,
             10
         )
         
-        # 결과 출력용 토픽들
         self.cmd_pub = self.create_publisher(String, 'robot_command', 10)
         self.img_pub = self.create_publisher(Image, 'camera/image_pose', 10)
 
-        self.get_logger().info("포즈 추정 구독 노드가 성공적으로 시작되었습니다. 'image_raw' 대기 중...")
+        # 📢 [추가] 터틀봇 소리 서비스 클라이언트 생성 및 대기
+        self.sound_cli = self.create_client(Sound, 'sound')
+        while not self.sound_cli.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('터틀봇 소리 서비스(/sound)를 기다리는 중...')
+        
+        self.sound_req = Sound.Request()
+
+        self.get_logger().info("포즈 추정 노드가 성공적으로 시작되었습니다. 'image_raw' 대기 중...")
+
+    # 📢 [추가] 소리를 제어하는 헬퍼 함수
+    def trigger_fall_sound(self):
+        """설정한 쿨다운 시간이 지나면 터틀봇에게 경고음(value: 2)을 요청합니다."""
+        now = self.get_clock().now()
+        elapsed = (now - self.last_sound_time).nanoseconds / 1e9
+        
+        if elapsed >= self.SOUND_COOL_DOWN:
+            self.get_logger().warn("🚨 낙상 감지! 터틀봇 삐뽀 경고음 발송 🚨")
+            self.sound_req.value = 2  # 삐빅 경고음
+            self.sound_cli.call_async(self.sound_req)
+            self.last_sound_time = now
 
     def detect_fall(self, kpts, kp_conf, box):
-        """
-        3가지 조건의 낙상 점수를 합산해 2점 이상이면 낙상으로 판정.
-
-        Keypoint indices (COCO 17):
-          5:l_shoulder  6:r_shoulder
-         11:l_hip      12:r_hip
-        """
+        """3가지 조건의 낙상 점수를 합산해 2점 이상이면 낙상으로 판정."""
         score = 0
         reasons = []
 
-        # 조건 1: 바운딩박스 가로/세로 비율 (누우면 가로가 길어짐)
+        # 조건 1: 바운딩박스 가로/세로 비율
         xmin, ymin, xmax, ymax = box.xyxy[0].tolist()
         w = xmax - xmin
         h = ymax - ymin
@@ -87,7 +103,7 @@ class PoseEstimationNode(Node):
             score += 1
             reasons.append(f"bbox={bbox_ratio:.2f}")
 
-        # 조건 2: 척추 각도 (어깨 중점 → 엉덩이 중점 벡터, 수평=0°, 수직=90°)
+        # 조건 2: 척추 각도
         spine_angle = 90.0
         l_sh, r_sh, l_hip, r_hip = 5, 6, 11, 12
         if (kp_conf is not None and
@@ -108,7 +124,7 @@ class PoseEstimationNode(Node):
                 score += 1
                 reasons.append(f"angle={spine_angle:.0f}°")
 
-        # 조건 3: 어깨-엉덩이 수직 거리 (누우면 거의 같은 높이)
+        # 조건 3: 어깨-엉덩이 수직 거리
         if (kp_conf is not None and
                 kp_conf[l_sh] >= self.KEYPOINT_THRESHOLD and
                 kp_conf[l_hip] >= self.KEYPOINT_THRESHOLD):
@@ -129,47 +145,42 @@ class PoseEstimationNode(Node):
     def image_callback(self, msg):
         start_time = self.get_clock().now()
         
-        # ROS2 이미지 메시지를 OpenCV 이미지(BGR)로 변환
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                raise ValueError("imdecode 결과가 None")
         except Exception as e:
             self.get_logger().error(f"이미지 변환 실패: {e}")
             return
 
-        # 이미지 전처리 (거울 효과 방지 및 색상 변환)
-        frame = cv2.flip(frame, 1)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # 모델 추론 수행
         results = self.model(frame_rgb, verbose=False)[0]
         keypoints = results.keypoints.xy.cpu().numpy()
         kpt_confs = results.keypoints.conf.cpu().numpy() if results.keypoints.conf is not None else None
         boxes = results.boxes
 
-        current_command = "STOP" # 기본 상태: 정지
+        current_command = "STOP"
 
-        # 객체별 시각화 및 제어 로직 분석
         for i, (box, kpts) in enumerate(zip(boxes, keypoints)):
             kp_conf = kpt_confs[i] if kpt_confs is not None else None
             confidence = box.conf[0].item()
             if confidence < self.CONFIDENCE_THRESHOLD:
                 continue
 
-            # 바운딩 박스 시각화
             xmin, ymin, xmax, ymax = map(int, box.xyxy[0].tolist())
             cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), self.COLORS['bbox'], 2)
             
             text = f"Person {confidence * 100:.1f}%"
             cv2.putText(frame, text, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.COLORS['text'], 2)
 
-            # 키포인트 시각화
             for j, kp in enumerate(kpts):
                 x, y = kp
                 conf = kp_conf[j] if kp_conf is not None else 1.0
                 if x > 0 and y > 0 and conf >= self.KEYPOINT_THRESHOLD:
                     cv2.circle(frame, (int(x), int(y)), 5, self.COLORS['keypoint'], -1)
 
-            # 스켈레톤 라인 시각화
             for connection in self.SKELETON_CONNECTIONS:
                 start_idx, end_idx = connection
                 s_conf = kp_conf[start_idx] if kp_conf is not None else 1.0
@@ -187,41 +198,34 @@ class PoseEstimationNode(Node):
             is_fall = self.update_fall_state(is_fall_frame)
 
             if is_fall:
-                # 빨간 바운딩박스
-                cv2.rectangle(frame, (xmin, ymin), (xmax, ymax),
-                               self.COLORS['fall_bbox'], 3)
+                cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), self.COLORS['fall_bbox'], 3)
 
-                # 반투명 빨간 배경 라벨
                 overlay = frame.copy()
-                cv2.rectangle(overlay, (xmin, ymin - 40), (xmax, ymin),
-                               (0, 0, 180), -1)
+                cv2.rectangle(overlay, (xmin, ymin - 40), (xmax, ymin), (0, 0, 180), -1)
                 cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
                 cv2.putText(frame, "FALL DETECTED!", (xmin, ymin - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                            self.COLORS['fall_text'], 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.COLORS['fall_text'], 2)
                 cv2.putText(frame, f"[{reason}]", (xmin, ymax + 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 100, 255), 1)
 
-                # 척추 방향선 시각화
                 l_sh, r_sh, l_hip, r_hip = 5, 6, 11, 12
                 if (kp_conf is not None and
-                        all(kp_conf[j] >= self.KEYPOINT_THRESHOLD
-                            for j in [l_sh, r_sh, l_hip, r_hip])):
+                        all(kp_conf[j] >= self.KEYPOINT_THRESHOLD for j in [l_sh, r_sh, l_hip, r_hip])):
                     smx = int((kpts[l_sh][0] + kpts[r_sh][0]) / 2)
                     smy = int((kpts[l_sh][1] + kpts[r_sh][1]) / 2)
                     hmx = int((kpts[l_hip][0] + kpts[r_hip][0]) / 2)
                     hmy = int((kpts[l_hip][1] + kpts[r_hip][1]) / 2)
                     cv2.line(frame, (smx, smy), (hmx, hmy), (0, 0, 255), 3)
-                    cv2.putText(frame, f"{angle:.0f}deg",
-                                (smx + 5, smy - 5),
+                    cv2.putText(frame, f"{angle:.0f}deg", (smx + 5, smy - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
                 current_command = "FALL_ALERT"
+                
+                # 📢 [추가] 낙상 확정 시 사운드 함수 발동!
+                self.trigger_fall_sound()
 
             else:
-                # [터틀봇 연동 제어 로직]
-                # 5: 왼쪽 어깨, 6: 오른쪽 어깨, 9: 왼쪽 손목, 10: 오른쪽 손목
                 if len(kpts) > 10 and kp_conf is not None:
                     if (kp_conf[5] >= self.KEYPOINT_THRESHOLD and kp_conf[6] >= self.KEYPOINT_THRESHOLD and
                             kp_conf[9] >= self.KEYPOINT_THRESHOLD and kp_conf[10] >= self.KEYPOINT_THRESHOLD):
@@ -232,12 +236,10 @@ class PoseEstimationNode(Node):
                         elif kpts[10][1] < kpts[6][1]:
                             current_command = "RIGHT"
 
-        # 제어 명령 토픽 발행
         cmd_msg = String()
         cmd_msg.data = current_command
         self.cmd_pub.publish(cmd_msg)
 
-        # 프레임 내 상단에 현재 명령 상태 및 FPS 표기
         cmd_color = self.COLORS['fall_text'] if current_command == "FALL_ALERT" else (255, 0, 0)
         cv2.putText(frame, f"CMD: {current_command}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, cmd_color, 2)
 
@@ -246,7 +248,6 @@ class PoseEstimationNode(Node):
         fps_text = f"FPS: {1.0 / processing_time:.2f}" if processing_time > 0 else "FPS: --"
         cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.COLORS['text'], 2)
 
-        # 결과 시각화 이미지를 다시 ROS2 토픽으로 발행
         try:
             img_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
             self.img_pub.publish(img_msg)
