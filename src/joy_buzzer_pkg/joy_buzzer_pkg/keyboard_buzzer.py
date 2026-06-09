@@ -3,6 +3,7 @@ import os
 import tty
 import termios
 import threading
+import time
 import rclpy
 from rclpy.node import Node
 from turtlebot3_msgs.srv import Sound
@@ -62,6 +63,7 @@ class KeyboardBuzzer(Node):
         self._client = self.create_client(Sound, 'sound')
         self._stop_timer = None
         self._current_key = None
+        self._key_press_time = 0.0
 
     def call_sound(self, value: int):
         if not self._client.service_is_ready():
@@ -72,17 +74,21 @@ class KeyboardBuzzer(Node):
 
     def play_midi(self, key: str):
         value = MIDI_MAP[key]
-        # 같은 키 유지 중이면 타이머만 리셋
+        now = time.monotonic()
         if self._current_key != key:
             self._current_key = key
+            self._key_press_time = now
             self.call_sound(value)
             print(f'♪ {NOTE_NAME.get(value)} ON ')
-        self._reset_stop_timer()
+        # 반복 시작 전(~500ms)엔 긴 타이머, 이후엔 짧은 타이머
+        elapsed = now - self._key_press_time
+        timeout = 0.15 if elapsed > 0.4 else 0.7
+        self._reset_stop_timer(timeout)
 
-    def _reset_stop_timer(self):
+    def _reset_stop_timer(self, timeout: float = 0.15):
         if self._stop_timer:
             self._stop_timer.cancel()
-        self._stop_timer = threading.Timer(0.15, self._stop_sound)
+        self._stop_timer = threading.Timer(timeout, self._stop_sound)
         self._stop_timer.start()
 
     def _stop_sound(self):
