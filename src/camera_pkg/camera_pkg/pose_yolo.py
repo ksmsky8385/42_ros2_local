@@ -10,9 +10,8 @@ from ultralytics import YOLO
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-from sensor_msgs.msg import Image, CompressedImage
+from sensor_msgs.msg import CompressedImage
 from turtlebot3_msgs.srv import Sound  # 📢 사운드 서비스 추가
-from cv_bridge import CvBridge
 
 # Wayland/X11 호환성 설정
 os.environ["QT_QPA_PLATFORM"] = "xcb"
@@ -44,8 +43,6 @@ class PoseEstimationNode(Node):
         self.FALL_HISTORY = []
         self.FALL_HISTORY_SIZE = 5
 
-        self.bridge = CvBridge()
-
         # 📢 [추가] 연속 사운드 호출 방지를 위한 타이머 변수
         self.last_sound_time = self.get_clock().now()
         self.SOUND_COOL_DOWN = 2.0  # 한 번 소리 내면 2초 동안은 중복 호출 방지
@@ -63,7 +60,7 @@ class PoseEstimationNode(Node):
         )
         
         self.cmd_pub = self.create_publisher(String, 'robot_command', 10)
-        self.img_pub = self.create_publisher(Image, 'camera/image_pose', 10)
+        self.img_pub = self.create_publisher(CompressedImage, 'camera/image_pose/compressed', 10)
 
         # 📢 [추가] 터틀봇 소리 서비스 클라이언트 생성 및 대기
         self.sound_cli = self.create_client(Sound, 'sound')
@@ -249,8 +246,12 @@ class PoseEstimationNode(Node):
         cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.COLORS['text'], 2)
 
         try:
-            img_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-            self.img_pub.publish(img_msg)
+            msg = CompressedImage()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.format = "jpeg"
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            msg.data = buf.tobytes()
+            self.img_pub.publish(msg)
         except Exception as e:
             self.get_logger().error(f"이미지 발행 실패: {e}")
 
