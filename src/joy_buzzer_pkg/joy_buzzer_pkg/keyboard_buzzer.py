@@ -2,8 +2,6 @@ import sys
 import os
 import tty
 import termios
-import threading
-import time
 import rclpy
 from rclpy.node import Node
 from turtlebot3_msgs.srv import Sound
@@ -61,9 +59,6 @@ class KeyboardBuzzer(Node):
         super().__init__('keyboard_buzzer')
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.WARN)
         self._client = self.create_client(Sound, 'sound')
-        self._stop_timer = None
-        self._current_key = None
-        self._key_press_time = 0.0
 
     def call_sound(self, value: int):
         if not self._client.service_is_ready():
@@ -71,31 +66,6 @@ class KeyboardBuzzer(Node):
         req = Sound.Request()
         req.value = value
         self._client.call_async(req)
-
-    def play_midi(self, key: str):
-        value = MIDI_MAP[key]
-        now = time.monotonic()
-        if self._current_key != key:
-            self._current_key = key
-            self._key_press_time = now
-            self.call_sound(value)
-            print(f'♪ {NOTE_NAME.get(value)} ON ')
-        # 반복 시작 전(~500ms)엔 긴 타이머, 이후엔 짧은 타이머
-        elapsed = now - self._key_press_time
-        timeout = 0.15 if elapsed > 0.4 else 0.7
-        self._reset_stop_timer(timeout)
-
-    def _reset_stop_timer(self, timeout: float = 0.15):
-        if self._stop_timer:
-            self._stop_timer.cancel()
-        self._stop_timer = threading.Timer(timeout, self._stop_sound)
-        self._stop_timer.start()
-
-    def _stop_sound(self):
-        if self._current_key:
-            print(f'  {NOTE_NAME.get(MIDI_MAP.get(self._current_key, 0))} OFF')
-        self._current_key = None
-        self.call_sound(STOP_VALUE)
 
 
 def get_key(settings):
@@ -105,16 +75,70 @@ def get_key(settings):
     return key
 
 
-def run_midi_mode(node, settings):
-    print("MIDI 모드 — 누르는 동안 소리 유지, q 로 종료")
+def find_keyboard():
+    try:
+        from evdev import InputDevice, ecodes, list_devices
+    except ImportError:
+        return None
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+            caps = dev.capabilities()
+            if ecodes.EV_KEY in caps:
+                keys = caps[ecodes.EV_KEY]
+                if ecodes.KEY_A in keys and ecodes.KEY_Z in keys:
+                    return dev
+        except Exception:
+            pass
+    return None
+
+
+def run_midi_mode(node):
+    try:
+        from evdev import ecodes
+    except ImportError:
+        print("evdev 미설치 — pip install evdev")
+        return
+
+    dev = find_keyboard()
+    if dev is None:
+        print("키보드 장치를 찾지 못했습니다")
+        return
+
+    EVDEV_MIDI = {
+        ecodes.KEY_A: 100, ecodes.KEY_W: 101, ecodes.KEY_S: 102,
+        ecodes.KEY_E: 103, ecodes.KEY_D: 104, ecodes.KEY_F: 105,
+        ecodes.KEY_T: 106, ecodes.KEY_G: 107, ecodes.KEY_Y: 108,
+        ecodes.KEY_H: 109, ecodes.KEY_U: 110, ecodes.KEY_J: 111,
+        ecodes.KEY_K: 112,
+    }
+
+    print(f"MIDI 모드 [{dev.name}] — 누르는 동안 소리 유지, q 종료")
     print("  흰건반: a s d f g h j k")
     print("  검은건반: w e t y u\n")
-    while rclpy.ok():
-        key = get_key(settings)
-        if key == 'q':
-            break
-        if key in MIDI_MAP:
-            node.play_midi(key)
+
+    dev.grab()
+    try:
+        for event in dev.read_loop():
+            if event.type != ecodes.EV_KEY:
+                continue
+            if event.code == ecodes.KEY_Q and event.value == 1:
+                break
+            if event.code not in EVDEV_MIDI:
+                continue
+            if event.value == 1:  # key down
+                value = EVDEV_MIDI[event.code]
+                node.call_sound(value)
+                print(f'♪ {NOTE_NAME.get(value)} ON')
+            elif event.value == 0:  # key up
+                node.call_sound(STOP_VALUE)
+                print(f'  OFF')
+    finally:
+        try:
+            dev.ungrab()
+        except Exception:
+            pass
+        node.call_sound(STOP_VALUE)
 
 
 def run_normal_mode(node, settings):
@@ -139,13 +163,10 @@ def main(args=None):
 
     try:
         if mode == '2':
-            run_midi_mode(node, settings)
+            run_midi_mode(node)
         else:
             run_normal_mode(node, settings)
     finally:
-        if node._stop_timer:
-            node._stop_timer.cancel()
-        node.call_sound(STOP_VALUE)
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
 
     node.destroy_node()
